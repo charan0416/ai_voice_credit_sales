@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CardBot Voice Assistant</title>
+    <style>
+        /* Styles remain unchanged from the previous valid version */
+        body {
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; background-color: #f0f2f5;
+            font-family: system-ui, sans-serif; margin: 0;
+        }
+        #interactionArea { text-align: center; }
+        #talkButton {
+            padding: 0; font-size: 1.5em; font-weight: 600;
+            cursor: pointer; border: none; border-radius: 50%;
+            color: white; box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+            transition: background-color 0.3s ease, box-shadow 0.2s ease, transform 0.1s ease;
+            outline: none; width: 160px; height: 160px;
+            display: flex; justify-content: center; align-items: center;
+            text-align: center; line-height: 1.2;
+            background-color: #007bff; /* Default Blue */
+        }
+        #talkButton:hover:not(:disabled) { background-color: #0056b3; box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25); transform: translateY(-2px); }
+        #talkButton:active:not(:disabled) { transform: scale(0.97); box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2); }
+        #talkButton:disabled { cursor: not-allowed; opacity: 0.7; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15); }
+        #talkButton.listening { background-color: #dc3545; /* Red */ }
+        #talkButton.thinking { background-color: #ffc107; /* Amber/Yellow */ color: #333; cursor: wait; }
+        #talkButton.speaking { background-color: #28a745; /* Green */ cursor: not-allowed; }
+        #talkButton.error { background-color: #6c757d; /* Grey */ cursor: not-allowed; }
+        /* Hide debug elements */
+        #status, #transcript, #response {
+             visibility: hidden; position: absolute; width: 0; height: 0;
+             overflow: hidden; margin: -1px; padding: 0; border: 0;
+             clip: rect(0 0 0 0); white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <!-- Hidden elements for potential debug logging -->
+    <div id="status">Idle</div>
+    <div id="transcript"></div>
+    <div id="response"></div>
+
+    <!-- Visible interaction area -->
+    <div id="interactionArea">
+        <button id="talkButton" aria-label="Activate Voice Assistant">Speak</button>
+    </div>
+
+    <script>
+        // Get references to elements
+        const talkButton = document.getElementById('talkButton');
+        const statusDiv = document.getElementById('status');
+        const transcriptDiv = document.getElementById('transcript');
+        const responseDiv = document.getElementById('response');
+
+        // --- Configuration ---
+        // Ensure this URL matches your running backend's address and port
+        const BACKEND_URL = 'http://localhost:8000/interact';
+
+        // --- State Management ---
+        let currentState = 'idle'; // 'idle', 'listening', 'thinking', 'speaking', 'error'
+
+        // --- Web Speech API Setup ---
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const synthesis = window.speechSynthesis;
+        let recognition;
+        let utterance = new SpeechSynthesisUtterance(); // Setup utterance object once
+
+        // Check browser support
+        if (!SpeechRecognition || !synthesis) {
+            console.error("CRITICAL: Web Speech API not supported.");
+            updateUIState('error', 'Not Supported');
+            talkButton.disabled = true;
+            alert('Voice interaction not supported. Use Chrome/Edge.');
+        } else {
+            console.log("Web Speech API detected.");
+            // Initialize recognition
+            recognition = new SpeechRecognition();
+            recognition.continuous = false;
+            recognition.lang = 'en-GB'; // British English
+            recognition.interimResults = false;
+            recognition.maxAlternatives = 1;
+
+            // Setup event handlers
+            setupRecognitionHandlers();
+            setupSynthesisHandlers();
+
+             // Preload voices (optional)
+             if (synthesis.getVoices().length === 0) {
+                 synthesis.onvoiceschanged = () => { console.log("Voices loaded:", synthesis.getVoices().length); };
+             }
+        }
+
+        // --- UI Update Function ---
+        function updateUIState(newState, buttonText = null) {
+            const oldState = currentState;
+            currentState = newState;
+            console.log(`UI State: ${oldState} -> ${newState}`);
+            let textContent = buttonText;
+            if (!textContent) {
+                switch (newState) { /* Assign default text based on state */
+                    case 'idle': textContent = 'Speak'; break;
+                    case 'listening': textContent = 'Listening...'; break;
+                    case 'thinking': textContent = 'Thinking...'; break;
+                    case 'speaking': textContent = 'Speaking...'; break;
+                    case 'error': textContent = 'Error'; break;
+                    default: textContent = 'Speak';
+                }
+            }
+            talkButton.textContent = textContent;
+            talkButton.classList.remove('listening', 'thinking', 'speaking', 'error');
+            if (newState !== 'idle') { talkButton.classList.add(newState); }
+            talkButton.disabled = !(newState === 'idle' || newState === 'error');
+            statusDiv.textContent = `Status: ${newState}`;
+        }
+
+        // --- Speech Recognition Handlers ---
+        function setupRecognitionHandlers() {
+            recognition.onstart = () => {
+                console.log('STT: Started.');
+                if(currentState !== 'listening') updateUIState('listening');
+            };
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript.trim();
+                console.log('STT: Result - "' + transcript + '"');
+                transcriptDiv.textContent = 'Transcript: ' + transcript;
+                if (transcript) {
+                    updateUIState('thinking');
+                    sendTextToBackend(transcript);
+                } else {
+                    console.warn("STT: Empty transcript.");
+                    speakText("I didn't quite catch that. Could you please speak again?");
+                    updateUIState('idle');
+                }
+            };
+            recognition.onerror = (event) => {
+                console.error('STT Error:', event.error, event.message);
+                let userErrorMessage = "Sorry, an error occurred with speech recognition.";
+                if (event.error === 'no-speech') userErrorMessage = "I didn't hear anything. Please tap and speak.";
+                else if (event.error === 'audio-capture') userErrorMessage = "Issue with microphone access. Check connection/permissions.";
+                else if (event.error === 'not-allowed') userErrorMessage = "Microphone access denied. Please enable permissions.";
+                else if (event.error === 'network') userErrorMessage = "Network issue during recognition.";
+                speakText(userErrorMessage);
+                updateUIState('error', 'STT Error');
+            };
+            recognition.onend = () => {
+                console.log('STT: Ended.');
+                if (currentState === 'listening') updateUIState('idle');
+            };
+        }
+
+        // --- Speech Synthesis Handlers Setup ---
+        function setupSynthesisHandlers() {
+             utterance.lang = 'en-GB';
+             utterance.pitch = 1.0; utterance.rate = 1.0;
+             utterance.onstart = () => { console.log('TTS: Started.'); if(currentState !== 'speaking') updateUIState('speaking'); };
+             utterance.onend = () => { console.log('TTS: Ended.'); updateUIState('idle'); }; // Return to idle AFTER speaking
+             utterance.onerror = (event) => {
+                console.error('TTS Error:', event.error);
+                alert("Apologies, voice response error.");
+                updateUIState('error', 'TTS Error');
+             };
+        }
+
+        // --- Speak Text Function ---
+        function speakText(textToSpeak) {
+            if (!synthesis || !textToSpeak) { console.warn("TTS: Skipped."); if(currentState !== 'idle') updateUIState('idle'); return; }
+            if (synthesis.speaking) { console.log("TTS: Cancelling previous speech."); synthesis.cancel(); }
+            utterance.text = textToSpeak;
+            const voices = synthesis.getVoices(); // Attempt voice selection
+            let selectedVoice = voices.find(v => v.lang === 'en-GB' && !v.name.includes('Male') && v.localService); // Prefer local female GB
+            if (!selectedVoice) selectedVoice = voices.find(v => v.lang === 'en-GB' && !v.name.includes('Male')); // Any female GB
+            if (!selectedVoice) selectedVoice = voices.find(v => v.lang === 'en-GB'); // Any GB
+            if (selectedVoice) { utterance.voice = selectedVoice; console.log(`TTS: Using voice - ${selectedVoice.name}`); }
+            else { console.warn("TTS: en-GB voice not found, using default."); utterance.voice = null; }
+            responseDiv.textContent = 'Bot: ' + textToSpeak;
+            console.log(`TTS: Queued - "${textToSpeak.substring(0, 100)}..."`);
+            synthesis.speak(utterance);
+        }
+
+        // --- Button Click Handler ---
+        talkButton.addEventListener('click', () => {
+            console.log(`Click in state: ${currentState}`);
+            if (!recognition) { console.error("Recognition unavailable."); return; }
+            switch (currentState) {
+                case 'idle': case 'error':
+                    try {
+                        if (synthesis.speaking) { synthesis.cancel(); }
+                        console.log("Click: Starting recognition.");
+                        recognition.start(); updateUIState('listening');
+                    } catch (e) {
+                        console.error("Error starting recognition:", e);
+                        if (e.name !== 'InvalidStateError') { speakText("Microphone access issue. Check permissions."); updateUIState('error', 'Mic Error'); }
+                    } break;
+                case 'listening': console.log("Click: Stopping recognition."); recognition.stop(); updateUIState('idle'); break;
+                case 'speaking': console.log("Click: Stopping speech."); synthesis.cancel(); updateUIState('idle'); break;
+                case 'thinking': console.log("Click: thinking (no action)."); break;
+                default: console.warn(`Click in unhandled state: ${currentState}`);
+            }
+        });
+
+        // --- Backend Communication ---
+        async function sendTextToBackend(text) {
+            if(currentState !== 'thinking') updateUIState('thinking');
+            console.log(`Sending: "${text}" to ${BACKEND_URL}`);
+            try {
+                const response = await fetch(BACKEND_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ text: text }),
+                });
+                const data = await response.json();
+                if (!response.ok) { throw new Error(data?.reply || data?.error || `Server error (${response.status})`); }
+                if (!data.reply) { throw new Error("Invalid response from server."); }
+                console.log(`Received: "${data.reply.substring(0, 100)}..."`);
+                speakText(data.reply);
+            } catch (error) {
+                console.error('Backend Comm Error:', error);
+                speakText(`Connection or processing error: ${error.message}`);
+                updateUIState('error', 'Comm Error');
+            }
+        }
+
+        // --- Initial UI State ---
+        updateUIState('idle');
+        console.log("Frontend Initialized. Ready for interaction.");
+
+    </script>
+</body>
+</html>
